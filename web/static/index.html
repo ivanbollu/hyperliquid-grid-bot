@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hyperliquid 网格交易台</title>
+<link rel="stylesheet" href="/static/style.css?v=__STATIC_V__" />
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">◧</span>
+    <div>
+      <h1>Hyperliquid 网格交易台</h1>
+      <div class="sub" id="connState">正在连接…</div>
+    </div>
+  </div>
+
+  <div class="kpis" id="kpis">
+    <div class="kpi"><label>总账户权益</label><b id="kAccount">—</b></div>
+    <div class="kpi"><label>浮动盈亏</label><b id="kUpnl">—</b></div>
+    <div class="kpi"><label>累计已实现</label><b id="kRealized">—</b></div>
+    <div class="kpi"><label>运行中实例</label><b id="kRunning">—</b></div>
+  </div>
+
+  <div class="topActions">
+    <button class="btn wallet" id="btnWallet" title="连接浏览器钱包，查看你在 Hyperliquid 上的真实账户">
+      <span class="wdot" id="wDot"></span>
+      <span id="wLabel">连接钱包</span>
+      <span class="wval" id="wVal"></span>
+    </button>
+    <button class="btn ghost" id="btnNew">＋ 新建实例</button>
+    <button class="btn danger" id="btnEmergency">⛔ 全局急停</button>
+  </div>
+</header>
+
+<main class="layout">
+  <aside class="sidebar">
+    <div class="sideTitle">
+      <span>交易实例</span>
+      <button class="mini" id="btnRefresh" title="刷新">⟳</button>
+    </div>
+    <div id="slotList" class="slotList"><div class="empty">加载中…</div></div>
+    <div class="sideFoot">
+      <div id="keyWarn" class="keyWarn hidden">未检测到私钥，实盘实例无法启动</div>
+      <div class="tip">新增实例＝在 <code>configs/</code> 下新建一个 yaml。<br>同一份配置可同时跑，互不干扰。</div>
+    </div>
+  </aside>
+
+  <section class="detail" id="detail">
+    <div class="empty big">从左侧选择一个实例</div>
+  </section>
+</main>
+
+<aside class="drawer" id="walletDrawer" aria-hidden="true">
+  <div class="drawerHead">
+    <h2>钱包账户</h2>
+    <span class="spacer"></span>
+    <button class="mini" id="wRefresh" title="刷新">⟳</button>
+    <button class="mini" id="wClose" title="关闭">✕</button>
+  </div>
+  <div class="drawerBody" id="wBody"></div>
+</aside>
+<div class="scrim hidden" id="wScrim"></div>
+
+<div class="modal hidden" id="modal">
+  <div class="modalBox" id="modalBox"></div>
+</div>
+
+<div id="toasts"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
+<script src="/static/app.js?v=__STATIC_V__"></script>
+</body>
+</html>

@@ -1,0 +1,103 @@
+slot: eth-trend
+# ============================================================================
+#  信号策略示例：EMA 交叉 + 跟踪止损（趋势跟随）
+# ----------------------------------------------------------------------------
+#  ⚠️ 上真钱之前必须先看回测结论（tools/backtest.py，2026-10-12 实测）：
+#
+#      ETH 15m / 最近 32 天（3073 根 K 线）：
+#        · 默认参数（EMA 12/48 + 跟踪止损 0.6%）：25 笔，胜率 16%，净亏 -0.4975 USDC
+#        · 手续费吃掉 0.1650，毛收益只有 -0.3325 —— 信号本身就是亏的
+#        · 前后两段分别跑：-0.2745 / -0.1599，两段都亏，不是运气问题
+#        · 24 组参数扫描里只有 1 组微弱为正（+0.0086），而它后半段是 -0.0600
+#        · 同期「买了不动」是 +2.86%（+0.3141 USDC）—— 跑输躺平
+#
+#      原因不是引擎写错了，而是：手续费（往返 0.03%~0.09%）+ 震荡行情里的反复假信号。
+#      结论：这个策略在当前行情下**不建议上真钱**。
+#      它留在这里的价值是：可以干跑观察、可作为以后换信号的骨架。
+#
+#  默认 dry_run: true，只连真实行情、纸面撮合，不花一分钱。
+# ============================================================================
+strategy: signal
+
+env:
+  network: mainnet
+  dry_run: true               # 确认回测/干跑都满意后再改 false
+  # 用 API 钱包（agent）交易时，这里必须填【主钱包】地址，否则查到的权益是 API 钱包自己的（$0）。
+  # 和 configs/eth-buy-2505.yaml 是同一个主钱包。
+  account_address: '0x'
+
+market:
+  coin: ETH
+  leverage: 5
+  margin_mode: isolated
+  base_size: 0.0044           # signal.size 为 0 时用这个；0.0044 ETH ≈ $11
+  reduce_only_tp: true
+  close_slippage_pct: 1.0
+
+# ---------------- 信号参数（strategy=signal 时生效） ----------------
+signal:
+  # ---- 数据 ----
+  interval: 15m               # K 线周期。5m 只有约 17.5 天历史，15m 约 30 天，1h 约 60 天
+  candles: 300                # 算指标用多少根已收盘 K 线
+  candle_cache_sec: 20        # K 线缓存秒数（别设太小，省接口额度）
+
+  # ---- 指标 ----
+  fast_ema: 12                # 快线
+  slow_ema: 48                # 慢线（必须大于快线）
+  trend_ema: 0                # >0 时只在收盘价位于该长期均线同侧才开仓（趋势过滤），0=关闭
+
+  # ---- 进场 ----
+  entry_mode: maker           # maker=挂在回撤价等成交（0.015% 费率）| taker=立即市价（0.045%）
+  entry_offset_pct: 0.05      # maker 模式：买单挂在现价下方 0.05%、卖单挂上方 0.05%
+  entry_ttl_sec: 90           # 挂单 90 秒没成交就撤掉，等下一次信号（价格没回撤说明不该追）
+  allow_short: false          # 死叉时是否反手做空（现货思维就先别开）
+
+  # ---- 出场 ----
+  atr_period: 14
+  atr_mult: 2.0               # 跟踪止损距离 = max(百分比, ATR × 倍数)
+  trail_pct: 0.6              # 跟踪止损百分比。0.6% ≈ 从最高点回撤 $15 就走
+  take_profit_pct: 0          # >0 时到价止盈；0=只用跟踪止损（趋势策略的常规做法）
+  exit_on_cross: true         # 反向交叉立即平仓
+
+  # ---- 仓位 ----
+  size: 0.0044                # 下单数量（币）。⚠ 名义必须 ≥ $10，否则交易所拒单
+  max_rounds: 3               # 最多做几轮（一轮 = 开 + 平）；0=不限。先设小值试探
+
+# ---------------- 网格参数（本实例不生效，切回 grid 策略才用） ----------------
+grid:
+  mode: long
+  anchor_price: 0
+  step_pct: 0.8
+  levels: 8
+  take_profit_pct: 0.8
+  reanchor: false
+  recenter_threshold_pct: 6.0
+
+martingale:
+  enabled: true
+  multiplier: 1.4
+  max_size_multiple: 8.0
+
+# ---------------- 风控（不要为了一单好看就调大） ----------------
+risk:
+  max_total_notional_usd: 500 # 名义持仓上限
+  max_open_orders: 24
+  max_unrealized_loss_usd: 30 # 浮亏熔断线（信号策略波动比网格大，先设紧一点）
+  max_position_size: 0.02     # 净持仓上限（币）
+  min_account_value_usd: 10   # 账户权益低于此值直接拒绝启动（同网格实例）
+  max_daily_orders: 60        # 信号策略一天可能开平好几轮，但也不该上百
+  cooldown_after_stop_sec: 3600
+
+runtime:
+  loop_interval_sec: 5        # 主循环间隔。信号按 K 线收盘触发，5 秒完全够
+  state_file: state/bot_state.json
+  log_dir: logs
+  log_level: INFO
+  equity_interval_sec: 30
+
+notify:
+  enabled: false
+  telegram_bot_token: ""
+  telegram_chat_id: ""
+  on_fill: false
+  on_stop: true

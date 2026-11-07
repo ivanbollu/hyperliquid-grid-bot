@@ -1,0 +1,835 @@
+"""配置加载：config.yaml + .env。"""
+
+from __future__ import annotations
+
+import os
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import yaml
+
+from .candles import VALID_INTERVALS
+
+# 策略类型
+STRATEGIES = ("grid", "trigger", "signal")
+
+# Hyperliquid 永续合约的单笔最低名义价值（USD）。写在配置里做前置校验，
+# 免得挂在盘口半天才发现被交易所拒单。
+MIN_ORDER_NOTIONAL_USD = 10.0
+
+
+# ---------------------------------------------------------------- 私钥格式
+def private_key_problem(key: str) -> str:
+    """检查 HL_PRIVATE_KEY 的格式，返回人话描述；没问题返回空串。
+
+    实践中填错最多的两种：把【钱包地址】当私钥填（40 位十六进制），
+    以及复制时漏了 0x 或带进了引号/空格/换行。
+    提前报出来，好过之后抛一段看不懂的 eth-account 堆栈。
+    """
+    t = (key or "").strip().strip('"').strip("'").strip()
+    if not t:
+        return ""
+    if t[:2].lower() == "0x":
+        t = t[2:]
+    if not re.fullmatch(r"[0-9a-fA-F]*", t):
+        return "HL_PRIVATE_KEY 含非十六进制字符（可能粘进了多余文字或换行）"
+    if len(t) == 40:
+        return "你填的是 40 位的【钱包地址】，不是私钥。私钥是 0x 开头、共 66 个字符"
+    if len(t) == 64:
+        return ""
+    return (
+        f"HL_PRIVATE_KEY 去掉 0x 后有 {len(t)} 位，应该是 64 位十六进制"
+        "（即 0x 开头共 66 个字符）"
+    )
+
+
+# ---------------------------------------------------------------- .env
+def load_dotenv(path: Path) -> None:
+    """极简 .env 解析，避免额外依赖。已存在的环境变量不会被覆盖。"""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+
+
+# ---------------------------------------------------------------- 配置结构
+@dataclass
+class EnvCfg:
+    network: str = "mainnet"
+    dry_run: bool = True   # ← 这是 Python 源码的默认值，不是你的开关，别改这里
+    account_address: str = ""
+
+    @property
+    def base_url(self) -> str:
+        from hyperliquid.utils import constants
+
+        return constants.TESTNET_API_URL if self.network.lower().startswith("test") else constants.MAINNET_API_URL
+
+    @property
+    def is_mainnet(self) -> bool:
+        return not self.network.lower().startswith("test")
+
+
+@dataclass
+class MarketCfg:
+    coin: str = "ETH"
+    leverage: int = 5
+    margin_mode: str = "isolated"
+    base_size: float = 0.01
+    reduce_only_tp: bool = True
+    close_slippage_pct: float = 1.0  # 熔断/平仓时的市价滑点容忍（%）
+
+    @property
+    def is_cross(self) -> bool:
+        return self.margin_mode.lower().startswith("cross")
+
+
+@dataclass
+class GridCfg:
+    mode: str = "long"  # long | short | neutral
+    anchor_price: float = 0.0
+    step_pct: float = 0.8
+    levels: int = 8
+    take_profit_pct: float = 0.8
+    reanchor: bool = False
+    recenter_threshold_pct: float = 6.0
+
+
+@dataclass
+class MartingaleCfg:
+    enabled: bool = True
+    multiplier: float = 1.4
+    max_size_multiple: float = 8.0
+
+
+@dataclass
+class TriggerCfg:
+    """触发单（条件单）：到价买入 / 卖出，一次或反复。
+
+    和网格的区别：网格是在区间内铺很多层反复吃差价，
+    触发单只关心「价格到达某个位置时下这一单」，更适合做单次建仓。
+    """
+
+    side: str = "buy"  # buy | sell
+    price: float = 0.0  # 触发价 / 挂单价
+    size: float = 0.0  # 下单数量（以币计）
+    order_type: str = "limit"  # limit=把限价单挂在盘口等成交 | market=价格穿越后立即市价成交
+    max_slippage_pct: float = 0.5  # market 模式的滑点容忍（%）
+    once: bool = True  # 成交后即视为完成，不再补挂
+    tp_pct: float = 0.0  # >0 时成交后自动挂 reduce-only 止盈（%）；0=不挂
+
+    @property
+    def is_buy(self) -> bool:
+        return self.side == "buy"
+
+
+@dataclass
+class SignalCfg:
+    """信号策略：用 K 线算指标，按信号实时开仓/平仓（默认 EMA 交叉 + 跟踪止损）。
+
+    和网格/触发单的根本区别：它**会主动平仓**，是完整的「买入 → 持有 → 卖出」循环，
+    而不只是挂一张单等成交。
+
+    ⚠️ 上真钱之前请先跑 `python tools/backtest.py`：
+       手续费（maker 0.015% / taker 0.045% 每边）是这类策略的天花板，
+       目标价差不到 0.1% 的玩法在这个费率下数学上就是亏的。
+    """
+
+    # ---- 数据 ----
+    interval: str = "15m"  # K 线周期：1m/5m/15m/30m/1h...
+    candles: int = 300  # 每次取多少根已收盘 K 线算指标
+    candle_cache_sec: float = 20.0  # K 线缓存时长（秒），别设太小吃掉接口额度
+
+    # ---- 指标 ----
+    fast_ema: int = 12
+    slow_ema: int = 48
+    trend_ema: int = 0  # >0 时，只在收盘价位于该长期均线同侧才开仓（趋势过滤）
+
+    # ---- 进场 ----
+    entry_mode: str = "maker"  # maker=挂在回撤价等成交（省手续费）| taker=立即市价
+    entry_offset_pct: float = 0.05  # maker 模式的挂单偏移（%）
+    entry_ttl_sec: float = 90.0  # maker 挂单多久没成交就撤掉重挂（0=不超时）
+    allow_short: bool = False  # 死叉时是否反手做空
+
+    # ---- 出场 ----
+    atr_period: int = 14
+    atr_mult: float = 2.0  # 跟踪止损距离 = max(百分比, ATR×倍数)
+    trail_pct: float = 0.6  # 跟踪止损百分比
+    take_profit_pct: float = 0.0  # >0 时到价止盈；0=只靠跟踪止损
+    exit_on_cross: bool = True  # 反向交叉时立即平仓
+
+    # ---- 仓位 ----
+    size: float = 0.0  # 下单数量（币）；<=0 时回退到 market.base_size
+    max_rounds: int = 0  # 0=不限；N=最多做 N 轮（一轮 = 开仓 + 平仓）
+
+    @property
+    def is_maker(self) -> bool:
+        return self.entry_mode == "maker"
+
+
+@dataclass
+class RiskCfg:
+    max_total_notional_usd: float = 500.0
+    max_open_orders: int = 24
+    max_unrealized_loss_usd: float = 60.0
+    max_position_size: float = 0.5
+    min_account_value_usd: float = 20.0
+    max_daily_orders: int = 200
+    cooldown_after_stop_sec: int = 3600
+
+
+@dataclass
+class RuntimeCfg:
+    loop_interval_sec: float = 5.0
+    state_file: str = "state/bot_state.json"
+    log_dir: str = "logs"
+    log_level: str = "INFO"
+    equity_interval_sec: float = 30.0  # 权益曲线采样间隔
+
+
+@dataclass
+class NotifyCfg:
+    enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    on_fill: bool = False  # 每次网格止盈都推送（会比较多）
+    on_stop: bool = True  # 启动/停止/熔断时推送
+
+
+@dataclass
+class Config:
+    strategy: str = "grid"  # grid=网格+马丁 | trigger=触发单 | signal=信号策略
+    env: EnvCfg = field(default_factory=EnvCfg)
+    market: MarketCfg = field(default_factory=MarketCfg)
+    grid: GridCfg = field(default_factory=GridCfg)
+    martingale: MartingaleCfg = field(default_factory=MartingaleCfg)
+    trigger: TriggerCfg = field(default_factory=TriggerCfg)
+    signal: SignalCfg = field(default_factory=SignalCfg)
+    risk: RiskCfg = field(default_factory=RiskCfg)
+    runtime: RuntimeCfg = field(default_factory=RuntimeCfg)
+    notify: NotifyCfg = field(default_factory=NotifyCfg)
+
+    root: Path = field(default_factory=Path.cwd)
+    private_key: str = ""
+    slot_name: str = ""
+    config_path: Optional[Path] = None
+
+    # ------------------------------------------------------------ 校验
+    def validate(self) -> None:
+        errs = []
+        if self.strategy not in STRATEGIES:
+            errs.append(f"strategy 只能是 {'/'.join(STRATEGIES)}，当前为 {self.strategy!r}")
+
+        if self.strategy == "grid":
+            if self.grid.mode not in ("long", "short", "neutral"):
+                errs.append(f"grid.mode 只能是 long/short/neutral，当前为 {self.grid.mode!r}")
+            if self.grid.levels < 1:
+                errs.append("grid.levels 必须 >= 1")
+            if self.grid.step_pct <= 0:
+                errs.append("grid.step_pct 必须 > 0")
+            if self.market.base_size <= 0:
+                errs.append("market.base_size 必须 > 0")
+            if self.martingale.enabled and self.martingale.multiplier < 1:
+                errs.append("martingale.multiplier 必须 >= 1（<1 就成了逆马丁）")
+            if self.martingale.max_size_multiple < 1:
+                errs.append("martingale.max_size_multiple 必须 >= 1")
+        elif self.strategy == "trigger":
+            t = self.trigger
+            if t.side not in ("buy", "sell"):
+                errs.append(f"trigger.side 只能是 buy/sell，当前为 {t.side!r}")
+            if t.price <= 0:
+                errs.append("trigger.price 必须 > 0（触发价 / 挂单价）")
+            if t.size <= 0:
+                errs.append("trigger.size 必须 > 0（下单数量，以币计）")
+            if t.order_type not in ("limit", "market"):
+                errs.append(f"trigger.order_type 只能是 limit/market，当前为 {t.order_type!r}")
+            if t.tp_pct < 0:
+                errs.append("trigger.tp_pct 不能为负（0 表示不挂止盈）")
+            # 交易所硬性门槛：永续单笔名义价值不得低于 $10，低于必然被拒
+            notional = t.size * t.price
+            if 0 < notional < MIN_ORDER_NOTIONAL_USD:
+                errs.append(
+                    f"trigger.size × price = ${notional:,.2f}，低于 Hyperliquid 的最低下单金额 "
+                    f"${MIN_ORDER_NOTIONAL_USD:,.0f}，会被拒单。请把 size 提到 "
+                    f"{MIN_ORDER_NOTIONAL_USD / t.price:.4f} 以上"
+                )
+
+        else:
+            s = self.signal
+            if s.interval not in VALID_INTERVALS:
+                errs.append(
+                    f"signal.interval 只能是 {'/'.join(VALID_INTERVALS)}，当前为 {s.interval!r}"
+                )
+            if s.fast_ema < 2:
+                errs.append("signal.fast_ema 必须 >= 2")
+            if s.slow_ema <= s.fast_ema:
+                errs.append(
+                    f"signal.slow_ema({s.slow_ema}) 必须大于 fast_ema({s.fast_ema})，否则没有交叉可言"
+                )
+            if s.trend_ema and s.trend_ema <= s.slow_ema:
+                errs.append(
+                    f"signal.trend_ema({s.trend_ema}) 应大于 slow_ema({s.slow_ema})"
+                    "（长期均线要更长才有过滤意义），或填 0 关闭趋势过滤"
+                )
+            if s.candles < s.slow_ema + 5:
+                errs.append(
+                    f"signal.candles({s.candles}) 至少要比 slow_ema({s.slow_ema}) 多 5 根，"
+                    "否则指标算不出来"
+                )
+            if s.entry_mode not in ("maker", "taker"):
+                errs.append(f"signal.entry_mode 只能是 maker/taker，当前为 {s.entry_mode!r}")
+            if s.entry_offset_pct < 0:
+                errs.append("signal.entry_offset_pct 不能为负")
+            if s.entry_ttl_sec < 0:
+                errs.append("signal.entry_ttl_sec 不能为负")
+            if s.trail_pct <= 0 and not (s.atr_mult > 0):
+                errs.append(
+                    "signal.trail_pct 与 atr_mult 至少要有一个 > 0，否则没有止损，"
+                    "一旦反向就是无限亏损"
+                )
+            if s.atr_mult < 0 or s.trail_pct < 0:
+                errs.append("signal 的止损参数不能为负")
+            if s.take_profit_pct < 0:
+                errs.append("signal.take_profit_pct 不能为负（0 表示只用跟踪止损）")
+            if s.max_rounds < 0:
+                errs.append("signal.max_rounds 不能为负（0 表示不限轮数）")
+            size = s.size if s.size > 0 else self.market.base_size
+            if size <= 0:
+                errs.append("signal.size 与 market.base_size 不能同时为 0（得出个下单量）")
+            # 注：$10 最低名义的检查不放这里 —— 离线校验拿不到真实价格，
+            # 硬猜一个价格只会误报。改由启动前体检 _check_plan() 用实时价判定。
+
+        if not (1 <= self.market.leverage <= 50):
+            errs.append("market.leverage 应在 1~50 之间")
+        if self.risk.max_unrealized_loss_usd <= 0:
+            errs.append("risk.max_unrealized_loss_usd 必须 > 0（风控不能关）")
+        if self.risk.max_total_notional_usd <= 0:
+            errs.append("risk.max_total_notional_usd 必须 > 0")
+        if self.risk.min_account_value_usd <= 0:
+            errs.append("risk.min_account_value_usd 必须 > 0")
+        if not self.env.dry_run and not self.private_key:
+            errs.append("真实下单模式需要私钥：请在 .env 里设置 HL_PRIVATE_KEY")
+        elif self.private_key:
+            prob = private_key_problem(self.private_key)
+            if prob:
+                errs.append(prob)
+        if self.env.account_address and not self._address_ok(self.env.account_address):
+            errs.append(
+                "env.account_address 不是合法地址（应是 0x + 40 位十六进制）。"
+                "用 API 钱包时这里填【主钱包】地址，不要填 API 钱包地址"
+            )
+        if errs:
+            raise ValueError("配置校验失败：\n  - " + "\n  - ".join(errs))
+
+    @staticmethod
+    def _address_ok(addr: str) -> bool:
+        # 延迟导入：wallet 会连带拉起 hyperliquid SDK，check/干跑不想为它买单
+        from .wallet import is_address
+
+        return is_address(addr)
+
+    # ------------------------------------------------------------ 概要
+    def summary(self) -> str:
+        if self.strategy == "signal":
+            s = self.signal
+            size = s.size if s.size > 0 else self.market.base_size
+            stop = f"跟踪止损 max({s.trail_pct}%, ATR×{s.atr_mult})"
+            if s.take_profit_pct > 0:
+                stop += f"　止盈 {s.take_profit_pct}%"
+            trend = f"　趋势过滤 EMA{s.trend_ema}" if s.trend_ema else ""
+            return (
+                f"网络={self.env.network}  干跑={'是' if self.env.dry_run else '否(真实下单)'}  "
+                f"标的={self.market.coin}  杠杆={self.market.leverage}x({self.market.margin_mode})\n"
+                f"策略=信号(EMA {s.fast_ema}/{s.slow_ema} 交叉){trend}  K线={s.interval}×{s.candles} 根\n"
+                f"进场={s.entry_mode}{'(回撤 %.2f%% 挂单)' % s.entry_offset_pct if s.is_maker else '(市价)'}"
+                f"　出场={stop}　做空={'开' if s.allow_short else '关'}\n"
+                f"下单量={size} {self.market.coin}　轮数上限={s.max_rounds or '不限'}　"
+                f"反向交叉{'平仓' if s.exit_on_cross else '不动'}\n"
+                f"风控: 名义上限 ${self.risk.max_total_notional_usd:,.0f} / "
+                f"浮亏熔断 ${self.risk.max_unrealized_loss_usd:,.0f} / "
+                f"持仓上限 {self.risk.max_position_size} / "
+                f"权益下限 ${self.risk.min_account_value_usd:,.0f}"
+            )
+        if self.strategy == "trigger":
+            t = self.trigger
+            kind = {True: "买入", False: "卖出"}[t.is_buy]
+            how = "挂限价单等成交" if t.order_type == "limit" else "价格穿越后市价成交"
+            tp = f"　止盈={t.tp_pct}%" if t.tp_pct > 0 else "　止盈=不挂"
+            return (
+                f"网络={self.env.network}  干跑={'是' if self.env.dry_run else '否(真实下单)'}  "
+                f"标的={self.market.coin}  杠杆={self.m
+				arket.leverage}x({self.market.margin_mode})\n"
+                f"策略=触发单({kind})  触发价={t.price}  数量={t.size} {self.market.coin}  "
+                f"名义≈${t.size * t.price:,.2f}\n"
+                f"触发方式={how}　成交后={'只建仓' if t.once else '继续挂'}{tp}\n"
+                f"风控: 名义上限 ${self.risk.max_total_notional_usd:,.0f} / "
+                f"浮亏熔断 ${self.risk.max_unrealized_loss_usd:,.0f} / "
+                f"持仓上限 {self.risk.max_position_size} / "
+                f"权益下限 ${self.risk.min_account_value_usd:,.0f}"
+            )
+        mode = {"long": "做多网格", "short": "做空网格", "neutral": "双向网格"}[self.grid.mode]
+        return (
+            f"网络={self.env.network}  干跑={'是' if self.env.dry_run else '否(真实下单)'}  "
+            f"标的={self.market.coin}  杠杆={self.market.leverage}x({self.market.margin_mode})\n"
+            f"策略={mode}  锚定价={self.grid.anchor_price or '自动'}  "
+            f"格间距={self.grid.step_pct}%  层数={self.grid.levels}  止盈={self.grid.take_profit_pct}%\n"
+            f"马丁={'开' if self.martingale.enabled else '关'} 倍数={self.martingale.multiplier} "
+            f"(上限 x{self.martingale.max_size_multiple})  基础下单量={self.market.base_size}\n"
+            f"风控: 名义上限 ${self.risk.max_total_notional_usd:,.0f} / "
+            f"浮亏熔断 ${self.risk.max_unrealized_loss_usd:,.0f} / "
+            f"持仓上限 {self.risk.max_position_size} / "
+            f"权益下限 ${self.risk.min_account_value_usd:,.0f}"
+        )
+
+    # ------------------------------------------------------------ 序列化
+    def as_dict(self, with_secrets: bool = False) -> Dict[str, Any]:
+        """给网页控制台用的纯字典。默认不含任何密钥。"""
+        d: Dict[str, Any] = {
+            "slot": self.slot_name,
+            "strategy": self.strategy,
+            "config_file": str(self.config_path.name) if self.config_path else "",
+            "env": {
+                "network": self.env.network,
+                "dry_run": self.env.dry_run,
+                "account_address": self.env.account_address,
+                "has_private_key": bool(self.private_key),
+            },
+            "market": {
+                "coin": self.market.coin,
+                "leverage": self.market.leverage,
+                "margin_mode": self.market.margin_mode,
+                "base_size": self.market.base_size,
+                "reduce_only_tp": self.market.reduce_only_tp,
+                "close_slippage_pct": self.market.close_slippage_pct,
+            },
+            "grid": {
+                "mode": self.grid.mode,
+                "anchor_price": self.grid.anchor_price,
+                "step_pct": self.grid.step_pct,
+                "levels": self.grid.levels,
+                "take_profit_pct": self.grid.take_profit_pct,
+                "reanchor": self.grid.reanchor,
+                "recenter_threshold_pct": self.grid.recenter_threshold_pct,
+            },
+            "martingale": {
+                "enabled": self.martingale.enabled,
+                "multiplier": self.martingale.multiplier,
+                "max_size_multiple": self.martingale.max_size_multiple,
+            },
+            "trigger": {
+                "side": self.trigger.side,
+                "price": self.trigger.price,
+                "size": self.trigger.size,
+                "order_type": self.trigger.order_type,
+                "max_slippage_pct": self.trigger.max_slippage_pct,
+                "once": self.trigger.once,
+                "tp_pct": self.trigger.tp_pct,
+            },
+            "signal": {
+                "interval": self.signal.interval,
+                "candles": self.signal.candles,
+                "candle_cache_sec": self.signal.candle_cache_sec,
+                "fast_ema": self.signal.fast_ema,
+                "slow_ema": self.signal.slow_ema,
+                "trend_ema": self.signal.trend_ema,
+                "entry_mode": self.signal.entry_mode,
+                "entry_offset_pct": self.signal.entry_offset_pct,
+                "entry_ttl_sec": self.signal.entry_ttl_sec,
+                "allow_short": self.signal.allow_short,
+                "atr_period": self.signal.atr_period,
+                "atr_mult": self.signal.atr_mult,
+                "trail_pct": self.signal.trail_pct,
+                "take_profit_pct": self.signal.take_profit_pct,
+                "exit_on_cross": self.signal.exit_on_cross,
+                "size": self.signal.size,
+                "max_rounds": self.signal.max_rounds,
+            },
+            "risk": {
+                "max_total_notional_usd": self.risk.max_total_notional_usd,
+                "max_open_orders": self.risk.max_open_orders,
+                "max_unrealized_loss_usd": self.risk.max_unrealized_loss_usd,
+                "max_position_size": self.risk.max_position_size,
+                "min_account_value_usd": self.risk.min_account_value_usd,
+                "max_daily_orders": self.risk.max_daily_orders,
+                "cooldown_after_stop_sec": self.risk.cooldown_after_stop_sec,
+            },
+            "runtime": {
+                "loop_interval_sec": self.runtime.loop_interval_sec,
+                "log_level": self.runtime.log_level,
+                "equity_interval_sec": self.runtime.equity_interval_sec,
+            },
+            "notify": {
+                "enabled": self.notify.enabled,
+                "telegram_chat_id": self.notify.telegram_chat_id,
+                "has_token": bool(self.notify.telegram_bot_token),
+                "on_fill": self.notify.on_fill,
+                "on_stop": self.notify.on_stop,
+            },
+        }
+        return d
+
+    def save_to(self, path: Optional[Path] = None, raw: Optional[Dict[str, Any]] = None) -> Path:
+        """把当前配置写回 YAML。
+
+        走的是行级改写（见 update_yaml_text），**不会抹掉文件里的注释** ——
+        手写的说明比自动生成的 dumps 值钱得多。
+        `raw` 参数只为兼容旧调用保留，现在不需要了。
+        """
+        path = Path(path or self.config_path)
+        d = self.as_dict()
+
+        updates: Dict[Optional[str], Dict[str, Any]] = {
+            None: {"slot": d["slot"] or path.stem, "strategy": d["strategy"]}
+        }
+        updates["env"] = {k: v for k, v in d["env"].items() if k != "has_private_key"}
+        for sec in ("market", "grid", "martingale", "trigger", "signal", "risk", "runtime"):
+            # 只写当前策略真正用到的段：网格配置里没必要凭空多出一块 trigger，
+            # 触发单/信号配置同理。切换策略时新段的键会被自动补上。
+            if sec in ("grid", "martingale") and self.strategy != "grid":
+                continue
+            if sec == "trigger" and self.strategy != "trigger":
+                continue
+            if sec == "signal" and self.strategy != "signal":
+                continue
+            updates[sec] = d[sec]
+        # telegram_bot_token 故意不在 as_dict 里，也就永远不会被网页改写
+        updates["notify"] = {k: v for k, v in d["notify"].items() if k != "has_token"}
+
+        text = ""
+        if path.exists():
+            try:
+                text = path.read_text(encoding="utf-8")
+                if text.strip():
+                    yaml.safe_load(text)  # 能解析才敢做行级改写
+            except Exception:
+                text = ""  # 解析不了就整份重写，至少保证文件可用
+
+        if not text.strip():
+            text = yaml.safe_dump({"slot": d["slot"] or path.stem}, allow_unicode=True, sort_keys=False)
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(update_yaml_text(text, updates), encoding="utf-8")
+        return path
+
+
+def _pick(data: Dict[str, Any], key: str, default):
+    v = data.get(key, default)
+    return default if v is None else v
+
+
+_TRUE_WORDS = {"true", "yes", "on", "1"}
+_FALSE_WORDS = {"false", "no", "off", "0"}
+
+
+def _as_bool(v: Any, default: bool = False, key: str = "") -> bool:
+    """严格解析布尔值。
+
+    ⚠️ 千万别直接用 `bool()`：YAML 里把 `false` 拼成 `flase`，读到的是一个
+    **非空字符串**，`bool("flase")` 是 True —— 于是"关掉干跑"变成"继续干跑"，
+    而且一声不吭（真实踩过这个坑）。这里只认白名单，认不出来就报错，
+    让人一眼看到自己拼错了。
+    """
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().strip('"').strip("'").lower()
+    if s in _TRUE_WORDS:
+        return True
+    if s in _FALSE_WORDS:
+        return False
+    hint = f"（配置项 {key}）" if key else ""
+    raise ValueError(
+        f"布尔值写得不对{hint}：{v!r}。只认 true/false"
+        "（常见的错是拼成 flase / ture / yes 带别的字符）"
+    )
+
+
+# ------------------------------------------------------- YAML 写回（保注释）
+def _fmt_scalar(key: str, value: Any) -> str:
+    """借 PyYAML 自己来决定标量怎么写，保证写回去能被原样读回来。
+
+    这一步很关键，不能手写：比如 `0x0a33...`（42 位十六进制）在 YAML 1.1 里
+    是合法的整数，不引号引起来读回来就变成一个大整数，钱包地址就废了。
+    """
+    # 整数就写成整数。配置里的数值读回来一律是 float，直接 dumps 会把
+    # `500` 写成 `500.0`，虽然等价，但会把人工对齐的注释顶歪。
+    if isinstance(value, float) and value.is_integer() and abs(value) < 1e15:
+        value = int(value)
+    try:
+        dumped = yaml.safe_dump({key: value}, allow_unicode=True, default_flow_style=False).strip()
+        if "\n" in dumped:
+            raise ValueError("不是标量")
+        _, _, tail = dumped.partition(":")
+        return tail.strip()
+    except Exception:
+        return yaml.safe_dump(str(value), allow_unicode=True, default_flow_style=False).strip() or "''"
+
+
+def _section_bounds(lines: List[str], section: str) -> Tuple[Optional[int], int]:
+    """找到 `section:` 那一行，以及它这一段的结束行号。"""
+    pat = re.compile(r"^" + re.escape(section) + r"\s*:")
+    start = None
+    for i, ln in enumerate(lines):
+        if pat.match(ln):
+            start = i
+            break
+    if start is None:
+        return None, -1
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        raw = lines[j]
+        if raw.strip() and not raw[:1].isspace():
+            end = j
+            break
+    return start, end
+
+
+def _value_equal(text: str, value: Any) -> bool:
+    """判断文件里现有的标量文本，和新值在语义上是否相同。
+
+    相同就整行不动 —— 这样 `1.0` 不会被改写成 `1`，`0.80` 也不会被改成 `0.8`，
+    人工排版过的配置不会因为一次保存就到处跳动。
+    """
+    text = text.strip()
+    if text == "":
+        return False
+    try:
+        cur = yaml.safe_load(text)
+    except Exception:
+        return False
+    if isinstance(value, bool):
+        return isinstance(cur, bool) and cur == value
+    if isinstance(cur, bool):
+        return False
+    if isinstance(cur, (int, float)) and isinstance(value, (int, float)):
+        return float(cur) == float(value)
+    return str(cur) == str(value)
+
+
+def _set_scalar(lines: List[str], section: Optional[str], key: str, value: Any) -> List[str]:
+    """在 lines 里就地改写一个键的值，保留缩进和行尾注释。"""
+    val = _fmt_scalar(key, value)
+    key_re = re.compile(r"^(?P<indent>\s*)(?P<key>" + re.escape(key) + r")\s*:(?P<rest>.*)$")
+    # 行尾注释：值与 ` #` 之间的部分原样保留
+    split_comment = re.compile(r"^(?P<val>.*?)(?P<comment>\s+#.*)?$")
+
+    if section is None:
+        lo, hi, indent = 0, len(lines), ""
+    else:
+        start, end = _section_bounds(lines, section)
+        if start is None:
+            # 整个 section 都不存在：追加到文件末尾
+            lines = list(lines)
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(f"{section}:")
+            lines.append(f"  {key}: {val}")
+            return lines
+        lo, hi = start + 1, end
+        indent = "  "
+        for j in range(lo, hi):
+            if lines[j].strip():
+                indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+                break
+
+    for j in range(lo, hi):
+        raw = lines[j]
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        if section is None and raw[:1].isspace():
+            continue
+        m = key_re.match(raw)
+        if not m:
+            continue
+        if section is not None and not m.group("indent"):
+            continue  # 同一段里缩进不一致的行不算
+        cm = split_comment.match(m.group("rest"))
+        if _value_equal(cm.group("val") or "", value):
+            return lines  # 值没变，连空格都不动
+        comment = cm.group("comment") or ""
+        lines[j] = f"{m.group('indent')}{key}: {val}{comment}"
+        return lines
+
+    # 键不存在
+    lines = list(lines)
+    if section is None:
+        # 顶层键（strategy / slot）插在文件开头那批顶层标量之后，
+        # 也就是紧跟 `slot:` 那一行；追加到文件末尾会在 notify 段后面，很难看。
+        insert_at = 0
+        for i, ln in enumerate(lines):
+            if not ln.strip() or ln.lstrip().startswith("#"):
+                continue
+            if ln[:1].isspace():
+                break  # 进到某个段的内部了，停
+            if ":" in ln and ln.split(":", 1)[1].strip():
+                insert_at = i + 1  # 顶层标量，记下位置继续找
+            else:
+                break  # 遇到 `env:` 这种段，停
+        lines.insert(insert_at, f"{key}: {val}")
+        return lines
+
+    # 段内键：插到这一段末尾
+    lines.insert(hi, f"{indent}{key}: {val}")
+    return lines
+
+
+def update_yaml_text(text: str, updates: Dict[Optional[str], Dict[str, Any]]) -> str:
+    """按「段 + 键」逐个改写 YAML，**保留原有注释与排版**。
+
+    本项目的配置全是一层标量（没有嵌套结构），所以用不着引入 ruamel.yaml
+    这种重依赖，自己做行级替换反而更好控制。
+
+    updates 形如 {None: {"slot": "x"}, "env": {...}, "grid": {...}}
+    """
+    lines = text.splitlines()
+    for section, mapping in updates.items():
+        for k, v in mapping.items():
+            lines = _set_scalar(lines, section, k, v)
+    out = "\n".join(lines)
+    if not out.endswith("\n"):
+        out += "\n"
+    return out
+
+
+def load_config(path: str | Path) -> Config:
+    path = Path(path).resolve()
+    # 配置放在 configs/ 子目录时，项目根目录要往上提一层，
+    # 否则 state/ logs/ 这些相对路径会指到 configs/ 里面去
+    root = path.parent.parent if path.parent.name == "configs" else path.parent
+    load_dotenv(root / ".env")
+
+    raw: Dict[str, Any] = {}
+    if path.exists():
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+    cfg = Config(root=root)
+    cfg.strategy = str(_pick(raw, "strategy", "grid")).lower()
+
+    e = raw.get("env") or {}
+    cfg.env = EnvCfg(
+        network=str(_pick(e, "network", "mainnet")),
+        # 这里用严格解析：把 false 拼成 flase 会直接报错，而不是静默当成 true
+        dry_run=_as_bool(_pick(e, "dry_run", True), True, "env.dry_run"),
+        account_address=str(_pick(e, "account_address", "") or ""),
+    )
+
+    m = raw.get("market") or {}
+    cfg.market = MarketCfg(
+        coin=str(_pick(m, "coin", "ETH")).upper(),
+        leverage=int(_pick(m, "leverage", 5)),
+        margin_mode=str(_pick(m, "margin_mode", "isolated")),
+        base_size=float(_pick(m, "base_size", 0.01)),
+        reduce_only_tp=_as_bool(_pick(m, "reduce_only_tp", True), True, "market.reduce_only_tp"),
+        close_slippage_pct=float(_pick(m, "close_slippage_pct", 1.0)),
+    )
+
+    g = raw.get("grid") or {}
+    cfg.grid = GridCfg(
+        mode=str(_pick(g, "mode", "long")).lower(),
+        anchor_price=float(_pick(g, "anchor_price", 0) or 0),
+        step_pct=float(_pick(g, "step_pct", 0.8)),
+        levels=int(_pick(g, "levels", 8)),
+        take_profit_pct=float(_pick(g, "take_profit_pct", 0.8)),
+        reanchor=_as_bool(_pick(g, "reanchor", False), False, "grid.reanchor"),
+        recenter_threshold_pct=float(_pick(g, "recenter_threshold_pct", 6.0)),
+    )
+
+    mg = raw.get("martingale") or {}
+    cfg.martingale = MartingaleCfg(
+        enabled=_as_bool(_pick(mg, "enabled", True), True, "martingale.enabled"),
+        multiplier=float(_pick(mg, "multiplier", 1.4)),
+        max_size_multiple=float(_pick(mg, "max_size_multiple", 8.0)),
+    )
+
+    tg = raw.get("trigger") or {}
+    cfg.trigger = TriggerCfg(
+        side=str(_pick(tg, "side", "buy")).lower(),
+        price=float(_pick(tg, "price", 0) or 0),
+        size=float(_pick(tg, "size", 0) or 0),
+        order_type=str(_pick(tg, "order_type", "limit")).lower(),
+        max_slippage_pct=float(_pick(tg, "max_slippage_pct", 0.5)),
+        once=_as_bool(_pick(tg, "once", True), True, "trigger.once"),
+        tp_pct=float(_pick(tg, "tp_pct", 0) or 0),
+    )
+
+    sg = raw.get("signal") or {}
+    cfg.signal = SignalCfg(
+        interval=str(_pick(sg, "interval", "15m")).lower(),
+        candles=int(_pick(sg, "candles", 300)),
+        candle_cache_sec=float(_pick(sg, "candle_cache_sec", 20)),
+        fast_ema=int(_pick(sg, "fast_ema", 12)),
+        slow_ema=int(_pick(sg, "slow_ema", 48)),
+        trend_ema=int(_pick(sg, "trend_ema", 0) or 0),
+        entry_mode=str(_pick(sg, "entry_mode", "maker")).lower(),
+        entry_offset_pct=float(_pick(sg, "entry_offset_pct", 0.05)),
+        entry_ttl_sec=float(_pick(sg, "entry_ttl_sec", 90)),
+        allow_short=_as_bool(_pick(sg, "allow_short", False), False, "signal.allow_short"),
+        atr_period=int(_pick(sg, "atr_period", 14)),
+        atr_mult=float(_pick(sg, "atr_mult", 2.0)),
+        trail_pct=float(_pick(sg, "trail_pct", 0.6)),
+        take_profit_pct=float(_pick(sg, "take_profit_pct", 0)),
+        exit_on_cross=_as_bool(_pick(sg, "exit_on_cross", True), True, "signal.exit_on_cross"),
+        size=float(_pick(sg, "size", 0) or 0),
+        max_rounds=int(_pick(sg, "max_rounds", 0) or 0),
+    )
+
+    r = raw.get("risk") or {}
+    cfg.risk = RiskCfg(
+        max_total_notional_usd=float(_pick(r, "max_total_notional_usd", 500)),
+        max_open_orders=int(_pick(r, "max_open_orders", 24)),
+        max_unrealized_loss_usd=float(_pick(r, "max_unrealized_loss_usd", 60)),
+        max_position_size=float(_pick(r, "max_position_size", 0.5)),
+        min_account_value_usd=float(_pick(r, "min_account_value_usd", 20)),
+        max_daily_orders=int(_pick(r, "max_daily_orders", 200)),
+        cooldown_after_stop_sec=int(_pick(r, "cooldown_after_stop_sec", 3600)),
+    )
+
+    rt = raw.get("runtime") or {}
+    cfg.runtime = RuntimeCfg(
+        loop_interval_sec=float(_pick(rt, "loop_interval_sec", 5)),
+        state_file=str(_pick(rt, "state_file", "state/bot_state.json")),
+        log_dir=str(_pick(rt, "log_dir", "logs")),
+        log_level=str(_pick(rt, "log_level", "INFO")).upper(),
+        equity_interval_sec=float(_pick(rt, "equity_interval_sec", 30)),
+    )
+
+    nt = raw.get("notify") or {}
+    cfg.notify = NotifyCfg(
+        enabled=_as_bool(_pick(nt, "enabled", False), False, "notify.enabled"),
+        telegram_bot_token=str(_pick(nt, "telegram_bot_token", "") or ""),
+        telegram_chat_id=str(_pick(nt, "telegram_chat_id", "") or ""),
+        on_fill=_as_bool(_pick(nt, "on_fill", False), False, "notify.on_fill"),
+        on_stop=_as_bool(_pick(nt, "on_stop", True), True, "notify.on_stop"),
+    )
+
+    cfg.private_key = os.environ.get("HL_PRIVATE_KEY", "").strip()
+    cfg.config_path = path
+    cfg.slot_name = str(raw.get("slot") or path.stem)
+
+    # 多实例：state_file / log_dir 按 slot 分开，避免互相覆盖
+    slot = cfg.slot_name
+    if slot:
+        sf = Path(cfg.runtime.state_file)
+        if sf.name == "bot_state.json":
+            cfg.runtime.state_file = str(sf.with_name(f"{slot}.state.json"))
+        cfg.runtime.log_dir = str(Path(cfg.runtime.log_dir) / slot)
+    return cfg
+
+
+def list_configs(configs_dir: Path) -> list:
+    """列出 configs/ 目录下所有可用的实例配置。"""
+    d = Path(configs_dir)
+    if not d.exists():
+        return []
+    return sorted(p for p in d.glob("*.yaml") if p.is_file())
